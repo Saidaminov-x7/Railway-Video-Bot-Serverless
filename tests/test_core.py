@@ -14,9 +14,9 @@ class CoreTests(unittest.TestCase):
                 list_telegram_ids({"TELEGRAM_ID_1": bad})
 
     def test_hostname_spoofing_http_credentials_and_ip_blocked(self):
-        domains = site_allowlist({})
+        domains = ("youtube.com", "instagram.com")
         bad = [
-            "https://youtube.com.attacker.test/watch?v=1", "https://127.0.0.1/a", "http://youtube.com/a",
+            "https://youtube.com.attacker.test/watch?v=1", "https://127.0.0.1/a",
             "https://user:pass@youtube.com/x", "https://youtube.com:444/x", "file:///etc/passwd",
             "https://youtube.com.evil.org", "https://localhost/a",
         ]
@@ -24,7 +24,12 @@ class CoreTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertFalse(valid_url(url, domains))
         self.assertTrue(valid_url("https://m.youtube.com/watch?v=123", domains))
-        self.assertTrue(valid_url("https://www.instagram.com/reel/foo/", domains))
+        self.assertTrue(valid_url("https://example.org/watch?v=123", ()))
+        self.assertFalse(valid_url("http://example.org:8080/a", ()))
+        self.assertFalse(valid_url("https://[::1]/a", ()))
+        self.assertFalse(valid_url("https://2130706433/a", ()))
+        self.assertFalse(valid_url("https://0x7f000001/a", ()))
+        self.assertFalse(valid_url("https://foo.railway.internal/a", ()))
 
     def test_two_links_are_kept_in_message_order(self):
         first = "https://youtu.be/abc"
@@ -35,8 +40,8 @@ class CoreTests(unittest.TestCase):
 
     def test_reject_bad_links_and_limit_ten(self):
         links, rejected = extract_links(" ".join(["https://youtu.be/1"] * 12) + " http://youtube.com/x", site_allowlist({}))
-        self.assertEqual(len(links), 10)
-        self.assertEqual(rejected, 3)
+        self.assertEqual(len(links), 2)
+        self.assertEqual(rejected, 0)
 
     def test_allowed_site_customization(self):
         self.assertEqual(site_allowlist({"ALLOWED_DOMAINS": "vimeo.com, Example.org"}), ("vimeo.com", "example.org"))

@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from aiohttp.test_utils import TestClient, TestServer
 from aiogram import Bot
+from aiohttp.test_utils import TestClient, TestServer
 
 from app import make_app
 from core import Settings
@@ -50,6 +50,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
             patch.object(Bot, "send_message", new=self.send),
             patch.object(Bot, "send_video", new=self.video),
             patch.object(Bot, "set_webhook", new=self.webhook),
+            patch.object(Bot, "get_webhook_info", new=AsyncMock(return_value=MagicMock(url="https://test.up.railway.app/telegram-webhook", max_connections=1))),
             patch.object(Bot, "__call__", new=self.bot_call),
         ]
         for p in self.patchers:
@@ -62,10 +63,16 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         await self.client.close()
 
     async def post(self, uid, text, secret=SECRET, seq=1):
-        return await self.client.post(
+        response = await self.client.post(
             "/telegram-webhook", json=update(uid, text, seq=seq),
             headers={"X-Telegram-Bot-Api-Secret-Token": secret},
         )
+        if response.status == 200:
+            for _ in range(50):
+                if self.bot_call.await_count:
+                    break
+                await asyncio.sleep(0.01)
+        return response
 
     async def test_secret_header_and_health(self):
         health = await self.client.get("/health")
@@ -74,7 +81,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         response = await self.post(OWNER_ID, "/start", secret="WRONG")
         self.assertEqual(response.status, 401)
         self.bot_call.assert_not_awaited()
-        self.webhook.assert_awaited_once()
+        self.webhook.assert_not_awaited()
 
     async def test_authorized_id_has_access_without_password(self):
         response = await self.post(OWNER_ID, "/start")
@@ -99,7 +106,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
             file.write_bytes(b"test-content")
             return file
 
-        with patch("app.fetch_video", new=fake_fetch):
+        with patch("app.public_url", new=AsyncMock(return_value=True)), patch("app.fetch_video", new=fake_fetch):
             response = await self.post(OWNER_ID, "https://youtu.be/abc")
             self.assertEqual(response.status, 200)
             async with asyncio.timeout(2):

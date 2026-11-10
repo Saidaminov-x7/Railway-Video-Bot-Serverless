@@ -67,7 +67,7 @@ async def fetch_video(url: str, folder: Path, settings: Settings) -> Path:
                 raise DownloadProblem("Недостаточно лимита для временных файлов.")
             try:
                 await asyncio.wait_for(proc.wait(), timeout=1.5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         if proc.returncode != 0:
             raise DownloadProblem("Не удалось скачать видео. Проверь ссылку или ограничения сайта.")

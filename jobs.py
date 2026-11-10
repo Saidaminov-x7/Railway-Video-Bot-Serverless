@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+
+LOG = logging.getLogger("video-bot.queue")
 
 
 @dataclass(frozen=True)
@@ -27,18 +30,37 @@ class GlobalFIFO:
             return None
         return position
 
+    def remove_chat(self, chat_id: int) -> int:
+        """Remove queued jobs owned by a chat while preserving FIFO for everyone else."""
+        retained: list[Job] = []
+        removed = 0
+        while True:
+            try:
+                job = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self.queue.task_done()
+            if job.chat_id == chat_id:
+                removed += 1
+            else:
+                retained.append(job)
+        for job in retained:
+            self.queue.put_nowait(job)
+        return removed
+
     async def run(self) -> None:
         while True:
             job = await self.queue.get()
             self.active = True
             try:
                 await self.processor(job)
-            except Exception:
+            except Exception as exc:
                 # Never print user URL, Telegram credentials, raw extractor errors.
+                LOG.warning("job failed: %s", type(exc).__name__)
                 try:
                     await self.on_error(job)
-                except Exception:
-                    pass
+                except Exception as notify_error:
+                    LOG.warning("job error notification failed: %s", type(notify_error).__name__)
             finally:
                 self.active = False
                 self.queue.task_done()

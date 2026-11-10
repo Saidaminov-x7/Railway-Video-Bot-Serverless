@@ -1,83 +1,56 @@
-# Telegram Video Bot — Railway Hobby
+# Telegram video bot (Railway)
 
-Бот с доступом по **числовому Telegram ID**, последовательной загрузкой и отправкой видео. Для публичных видео, скачивание которых разрешено правообладателем и условиями соответствующей платформы.
+Python 3.12, aiogram 3 webhook bot with one in-memory FIFO worker. Downloads are temporary and deleted after each job. Access is limited to Telegram user IDs configured in Railway Variables. Use only for content you have the right to download.
 
-## Возможности
+## Current implementation status
 
-- **Telegram ID вместо паролей.** В Railway Variables задаются `TELEGRAM_ID_1`, `TELEGRAM_ID_2`, ... (положительные числовые идентификаторы). Только перечисленные пользователи могут отправлять ссылки. После засыпания/перезапуска входить снова не требуется.
-- `/start` — проверка доступа, `/id` — узнать свой числовой Telegram ID. Бот принимает сообщения **только в личном чате**.
-- Одновременно работает **одна глобальная FIFO-очередь** и **один worker**: сначала скачивание и отправка №1, только затем скачивание №2. Пришли несколько ссылок в одном сообщении или подряд.
-- Временные файлы удаляются после каждой попытки отправки, включая ошибки. Без базы, истории и Railway Volume. Авторизованные ID загружаются из Variables.
-- HTTPS-ссылки проверяются по списку доменов. По умолчанию: YouTube, Instagram, TikTok, Facebook, X, Pinterest, Vimeo, Dailymotion и некоторые связанные домены. Сайты могут блокировать автоматическое скачивание; поддержка не гарантируется.
-- На каждую ссылку применяется лимит размера файла, диска и времени. Бот не скачивает DRM/приватные материалы и не использует cookies.
+This repository is **not yet production ready**. The current downloader supports yt-dlp video downloads with a job timeout, download retry settings, disk-size checks, and temporary-directory cleanup. It does not yet implement all requested behavior: metadata-based format selection/transcoding, cookies, gallery/carousel delivery, media probing/thumbnails, classified extractor errors, active-job cancellation, per-user rate limiting, and complete resource caps. Do not rely on the bot for arbitrary URLs until redirect and DNS protections have been independently validated against real sites.
 
-## Режимы и стоимость
+No site matrix is claimed here: network downloads and Telegram sends have not been run in this development session. Public site access varies by region, account state, platform changes, and yt-dlp extractor version.
 
-| Режим | Ограничение загрузки файла | Сервисы | Сон |
-|---|---:|---|---|
-| `BOT_MODE=eco` | 45 MB по умолчанию (обычный Bot API — до 50 MB) | один `video-bot` | Railway Serverless может перевести сервис в сон |
-| `BOT_MODE=large` | 1900 MB по умолчанию (Local Bot API — до 2000 MB) | `video-bot` + `telegram-api` | локальный Bot API, как правило, остаётся активным |
+## Local setup
 
-**Важно:** Railway Hobby оплачивается по тарифу, отдельно учитывает активные ресурсы/трафик. Нельзя обещать одновременно работу с файлами до 2 GB и нулевое использование RAM **обоих** сервисов в ожидании. Для сценария одного ролика 25 MB в день лучше `eco`.
-
-## Запуск в Railway — экономный режим
-
-1. Создай Telegram-бота в **@BotFather** и сохрани токен в секрете.
-2. Создай **приватный** GitHub-репозиторий и загрузите сюда исходные файлы. Никогда не публикуй реальные Telegram ID без необходимости; `.env` и токены не должны попадать в git.
-3. В Railway → **New Project** → **Deploy from GitHub repo** → выбери репозиторий. Сервис соберётся из `Dockerfile`. Replicas = **1**.
-4. В Railway → Settings → Networking → Public Networking → **Generate Domain**. Railway обычно предоставляет `RAILWAY_PUBLIC_DOMAIN`. Если нет, задай `WEBHOOK_BASE_URL=https://имя.up.railway.app`.
-5. В Railway → Variables добавь:
-
-   ```env
-   BOT_TOKEN=секретный_токен_из_BotFather
-   TELEGRAM_ID_1=ВАШ_ЧИСЛОВОЙ_TELEGRAM_ID
-   TELEGRAM_ID_2=ЧИСЛОВОЙ_ID_ВТОРОГО_ПОЛЬЗОВАТЕЛЯ
-   WEBHOOK_SECRET=случайная_URL_SAFE_строка_не_менее_16_символов
-   BOT_MODE=eco
-   MAX_FILE_MB=45
-   MAX_QUEUE=20
-   ```
-
-   **До первого запуска** получи свой числовой Telegram ID и замени пример — не разворачивай бот с фиктивными ID, иначе доступ может получить посторонний. После запуска команда `/id` позволит проверить ID. Можно добавлять `TELEGRAM_ID_3`, `TELEGRAM_ID_4` и так далее. При добавлении Variables Railway может выполнить redeploy. Случайный секрет: `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
-6. Settings → Deploy → **Serverless / App Sleeping** → Enable. После включения **redeploy**, иначе уже работающий контейнер не получит эту настройку.
-7. Не используй Volume, внешние uptime-проверки/keepalive, циклический long polling и реплики: они мешают сну или нарушают единую очередь.
-8. В Railway Deployments → Logs проверь запуск и установку webhook. В Telegram отправь `/start`, затем 2 разрешённые ссылки. Один ролик должен отправиться до начала скачивания следующего. Несанкционированные ID получат «Доступ запрещён».
-9. После **5–10 минут без исходящих пакетов** Railway может усыпить сервис. Холодный запуск по Telegram Webhook может вызвать задержку и даже 502 на первом запросе; Telegram обычно повторяет неуспешную доставку. Проверь реальное состояние в Railway Metrics.
-
-**Сон не означает мгновенное выключение после файла**: Railway самостоятельно определяет бездействие. При активной загрузке бот периодически посылает `sendChatAction`, чтобы снизить риск засыпания во время работы.
-
-## Крупные файлы до 2 GB (отдельный режим)
-
-Для файла более 50 MB нужен **Local Telegram Bot API Server**.
-
-1. В Railway добавь приватный внутренний сервис `telegram-api`, например из образа `aiogram/telegram-bot-api:latest`. API ID и Hash получи на https://my.telegram.org/apps.
-2. У сервиса `telegram-api` укажи `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_LOCAL=1`, `TELEGRAM_HTTP_IP_ADDRESS=[::]`. Не открывай Public Domain.
-3. Для `video-bot` укажи `BOT_MODE=large`, `MAX_FILE_MB=1900`, `TELEGRAM_API_BASE=http://telegram-api.railway.internal:8081` (проверить конкретный private hostname/port в Railway).
-4. При **первом** переключении с облачного API на локальный требуется корректный однократный `logOut` из облачного API по документации Telegram. Нельзя выполнять `logOut` после каждого рестарта. Для возврата к облачному API требуется корректная миграция.
-5. Не включай Serverless на `telegram-api` без E2E-проверки доставки входящих webhook после сна.
-
-Эта опция не развернута автоматически. Для реальной проверки видео >50 MB нужны рабочие Telegram API ID/hash, бот-токен, Railway и развёрнутые сервисы.
-
-## Безопасность и ограничения
-
-- Telegram ID — не пароль; их можно узнать, но отправитель Telegram Webhook проверяется по `WEBHOOK_SECRET`, а ID берётся из проверенного Telegram Update, не из текста пользователя.
-- Для изменения списка ID изменяй Variables и выполняй redeploy. ID в `.env.example` — **фиктивные примеры**.
-- Очередь только в RAM: при restarts/deploy активные и ожидающие задачи теряются. Это осознанный компромисс с «не хранить ничего». Токен и секрет не пишутся в исходники.
-- Временный каталог очищается в `finally`/контекстном менеджере, но внезапное уничтожение контейнера может оставить файлы до удаления контейнера; Telegram хранит отправленные файлы у себя.
-- Скачивание с отдельных сайтов зависит от доступа к видео и работы `yt-dlp`. DRM, приватные аккаунты, cookies и обход блокировок не предусмотрены.
-- `/health` предназначен для диагностики вручную. Не опрашивай его постоянно — это разбудит сервис или будет мешать сну.
-
-## Локальные проверки
-
-Python 3.12+:
+Python 3.12 and FFmpeg/ffprobe are required. Install and run the local checks:
 
 ```powershell
-py -3 -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 .\.venv\Scripts\python.exe -m compileall -q app.py core.py jobs.py downloader.py
 ```
 
-`python app.py` потребует настоящих `BOT_TOKEN`, `TELEGRAM_ID_1`, `WEBHOOK_SECRET` и публичного webhook-домена. Локальные тесты проверяют контроль потока и входящие запросы через моки, но не заменяют реальную отправку в Telegram.
+Set the environment variables below before running `python app.py`. Do not commit `.env` or any real credentials.
 
-Официальная документация: https://docs.railway.com/deployments/serverless · https://core.telegram.org/bots/api · https://docs.aiogram.dev/ · https://github.com/yt-dlp/yt-dlp
+## Configuration
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `BOT_TOKEN` | yes | BotFather token; secret |
+| `TELEGRAM_ID_1`, `TELEGRAM_ID_2`, … | yes | Positive numeric Telegram user IDs allowed to use the bot |
+| `WEBHOOK_SECRET` | yes | 16–256 URL-safe characters used to authenticate Telegram webhooks |
+| `WEBHOOK_BASE_URL` | one of these | Public HTTPS origin for the webhook |
+| `RAILWAY_PUBLIC_DOMAIN` | one of these | Used to construct the webhook origin when `WEBHOOK_BASE_URL` is unset |
+| `BOT_MODE` | no | `eco` (default) or `large` |
+| `TELEGRAM_API_BASE` | large only | Private Local Bot API service URL |
+| `MAX_FILE_MB` | no | Upload limit; defaults to 45 MB (`eco`) or 1900 MB (`large`) |
+| `MAX_QUEUE` | no | Bounded queue capacity; default 20 |
+| `DOWNLOAD_TIMEOUT` | no | Per-download seconds; default 3600 |
+| `UPLOAD_TIMEOUT` | no | Telegram upload timeout; default 3600 |
+| `ALLOWED_DOMAINS` | no | Optional comma-separated host suffix allowlist; unset means any syntactically public URL |
+| `BLOCKED_DOMAINS` | no | Comma-separated host suffix denylist |
+
+Never place cookies or private content credentials in a URL. Cookies support is not implemented yet.
+
+## Railway deployment notes
+
+Build from the repository Dockerfile, expose the configured `PORT`, set one replica, and configure a public domain before starting the bot. The image installs FFmpeg, Deno, and the pinned yt-dlp version. Override the Docker build argument `YTDLP_VERSION` to select another release. `requirements.txt` lists the runtime extras and unpinned local development dependency; the Docker argument pins the production image. Current pin: `2026.10.26`.
+
+Webhook delivery may have a cold-start delay or a 502 on the first request; confirm actual retry and wake behavior in Railway logs and Metrics before relying on Serverless. This repository has not been deployed or observed on Railway as part of this work. Do not add external uptime pings. The bot checks webhook configuration on startup and has an in-memory queue, so pending jobs are lost if the process restarts.
+
+`large` requires a separate Local Bot API service with valid Telegram API ID/hash configuration and a one-time cloud `logOut` migration when switching API servers. Large uploads and Serverless interaction with that service have not been tested here; do not enable sleeping on the Local Bot API without an end-to-end wake/delivery test. The present code does not establish a tested >50 MB path.
+
+## Tests and limitations
+
+The default unit suite is local and mocked. Network tests, actual Telegram delivery, large-file upload, Railway sleep/wake behavior, and site-by-site results remain unverified. `ruff` and the Docker build are configured in GitHub Actions, but must pass in CI before release.
+
+yt-dlp is installed with `default` and `curl-cffi` extras, plus `yt-dlp-ejs`; YouTube currently needs a supported JavaScript runtime such as Deno for full extractor functionality. Browser impersonation and extractor success are not guaranteed for any individual site. DRM, access-control circumvention, and unauthorized content are out of scope.

@@ -5,9 +5,9 @@ import asyncio
 import contextlib
 import logging
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 
-from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
@@ -15,12 +15,15 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
-from core import Settings, extract_links
+from core import Settings, extract_links, public_url
 from downloader import DownloadProblem, fetch_video
 from jobs import GlobalFIFO, Job
 
 LOG = logging.getLogger("video-bot")
+QUEUE_TASK_KEY = web.AppKey("queue_task", asyncio.Task)
+SEEN_UPDATES = web.AppKey("seen_updates", OrderedDict)
 
 
 async def upload_video(bot: Bot, job: Job, settings: Settings) -> None:
@@ -73,9 +76,15 @@ def make_app(settings: Settings) -> web.Application:
     else:
         bot = Bot(token=settings.token)
 
+    async def process(job: Job) -> None:
+        if not await public_url(job.url, settings.domains, settings.blocked_domains):
+            await bot.send_message(job.chat_id, "Ссылка ведёт на недоступный или небезопасный адрес.")
+            return
+        await upload_video(bot, job, settings)
+
     worker = GlobalFIFO(
         limit=settings.max_queue,
-        processor=lambda job: upload_video(bot, job, settings),
+        processor=process,
         on_error=lambda job: bot.send_message(job.chat_id, "Ошибка обработки. Повтори отправку ссылки."),
     )
     router = Router()
@@ -96,6 +105,21 @@ def make_app(settings: Settings) -> web.Application:
         else:
             await message.answer("Доступ запрещён. Узнай свой ID командой /id и добавь его в Railway Variables.")
 
+    @router.message(Command("help"), F.chat.type == "private")
+    async def command_help(message: Message) -> None:
+        await message.answer("Пришли публичную ссылку на контент. /status — очередь, /cancel — отменить свои ожидающие ссылки.")
+
+    @router.message(Command("status"), F.chat.type == "private")
+    async def command_status(message: Message) -> None:
+        if allowed(message):
+            await message.answer(f"Режим: {settings.mode}; в очереди: {worker.queue.qsize()}; выполняется: {'да' if worker.active else 'нет'}.")
+
+    @router.message(Command("cancel"), F.chat.type == "private")
+    async def command_cancel(message: Message) -> None:
+        if allowed(message):
+            removed = worker.remove_chat(message.chat.id)
+            await message.answer(f"Удалено из очереди: {removed}. Текущую загрузку отменить нельзя.")
+
     @router.message(F.chat.type == "private", F.text)
     async def message_text(message: Message) -> None:
         if not message.from_user or not message.text:
@@ -103,7 +127,7 @@ def make_app(settings: Settings) -> web.Application:
         if not allowed(message):
             await message.answer("Доступ запрещён. Для получения Telegram ID отправь /id.")
             return
-        urls, invalid = extract_links(message.text, settings.domains)
+        urls, invalid = extract_links(message.text, settings.domains, blocked=settings.blocked_domains)
         if not urls:
             await message.answer("Пришли HTTPS-ссылку на видео с поддерживаемого сайта.")
             return
@@ -134,14 +158,16 @@ def make_app(settings: Settings) -> web.Application:
 
     async def start(bot: Bot) -> None:
         # One in-memory worker for all users: no overlapping download or upload.
-        app["queue_task"] = asyncio.create_task(worker.run(), name="global-single-worker")
+        app[QUEUE_TASK_KEY] = asyncio.create_task(worker.run(), name="global-single-worker")
         # No drop_pending_updates: avoids discarding user messages during cold start.
         # max_connections=1 preserves order of delivery from Telegram as much as API allows.
-        await bot.set_webhook(settings.webhook_url, secret_token=settings.webhook_secret, max_connections=1, allowed_updates=["message"])
+        info = await bot.get_webhook_info()
+        if info.url != settings.webhook_url or info.max_connections != 1:
+            await bot.set_webhook(settings.webhook_url, secret_token=settings.webhook_secret, max_connections=1, allowed_updates=["message"])
         LOG.warning("Bot started in mode=%s; one global worker", settings.mode)
 
     async def stop(bot: Bot) -> None:
-        task = app.get("queue_task")
+        task = app.get(QUEUE_TASK_KEY)
         if task:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -152,6 +178,18 @@ def make_app(settings: Settings) -> web.Application:
     dp.shutdown.register(stop)
 
     app = web.Application(client_max_size=1 * 1024 * 1024)
+    app[SEEN_UPDATES] = OrderedDict()
+
+    async def deduplicate(handler, update, data):
+        seen = app[SEEN_UPDATES]
+        if update.update_id in seen:
+            return None
+        seen[update.update_id] = None
+        if len(seen) > 2048:
+            seen.popitem(last=False)
+        return await handler(update, data)
+
+    dp.update.outer_middleware(deduplicate)
 
     async def health(request: web.Request) -> web.Response:
         return web.Response(text="OK")
@@ -161,7 +199,7 @@ def make_app(settings: Settings) -> web.Application:
         dispatcher=dp,
         bot=bot,
         secret_token=settings.webhook_secret,
-        handle_in_background=False,
+        handle_in_background=True,
     ).register(app, path="/telegram-webhook")
     setup_application(app, dp, bot=bot)
     return app

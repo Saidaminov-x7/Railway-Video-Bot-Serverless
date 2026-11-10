@@ -2,10 +2,10 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch, AsyncMock
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from downloader import disk_used, DownloadProblem, fetch_video
+from downloader import disk_used, fetch_video
 
 
 class DownloadTests(unittest.IsolatedAsyncioTestCase):
@@ -25,15 +25,15 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
 
         proc = FakeProc()
         config = SimpleNamespace(max_file_mb=45, timeout_sec=180)
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch("downloader.asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)), \
-                 patch("downloader.terminate_process", new_callable=AsyncMock) as kill:
-                task = asyncio.create_task(fetch_video("https://youtu.be/abc", Path(tmp), config))
-                await asyncio.sleep(0.02)
-                task.cancel()
-                with self.assertRaises(asyncio.CancelledError):
-                    await task
-                kill.assert_awaited_once_with(proc)
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("downloader.asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)), \
+             patch("downloader.terminate_process", new_callable=AsyncMock) as kill:
+            task = asyncio.create_task(fetch_video("https://youtu.be/abc", Path(tmp), config))
+            await asyncio.sleep(0.02)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            kill.assert_awaited_once_with(proc)
 
 
 if __name__ == "__main__":

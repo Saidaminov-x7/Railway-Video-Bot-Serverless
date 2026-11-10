@@ -30,15 +30,15 @@
 
    ```env
    BOT_TOKEN=секретный_токен_из_BotFather
-   TELEGRAM_ID_1=123456789
-   TELEGRAM_ID_2=987654321
+   TELEGRAM_ID_1=ВАШ_ЧИСЛОВОЙ_TELEGRAM_ID
+   TELEGRAM_ID_2=ЧИСЛОВОЙ_ID_ВТОРОГО_ПОЛЬЗОВАТЕЛЯ
    WEBHOOK_SECRET=случайная_URL_SAFE_строка_не_менее_16_символов
    BOT_MODE=eco
    MAX_FILE_MB=45
    MAX_QUEUE=20
    ```
 
-   Замени примеры ID на настоящие. Узнать ID можно через команду `/id` в боте (после первого запуска). Можно добавлять `TELEGRAM_ID_3`, `TELEGRAM_ID_4` и так далее. При добавлении Variables Railway может выполнить redeploy. Случайный секрет: `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+   **До первого запуска** получи свой числовой Telegram ID и замени пример — не разворачивай бот с фиктивными ID, иначе доступ может получить посторонний. После запуска команда `/id` позволит проверить ID. Можно добавлять `TELEGRAM_ID_3`, `TELEGRAM_ID_4` и так далее. При добавлении Variables Railway может выполнить redeploy. Случайный секрет: `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
 6. Settings → Deploy → **Serverless / App Sleeping** → Enable. После включения **redeploy**, иначе уже работающий контейнер не получит эту настройку.
 7. Не используй Volume, внешние uptime-проверки/keepalive, циклический long polling и реплики: они мешают сну или нарушают единую очередь.
 8. В Railway Deployments → Logs проверь запуск и установку webhook. В Telegram отправь `/start`, затем 2 разрешённые ссылки. Один ролик должен отправиться до начала скачивания следующего. Несанкционированные ID получат «Доступ запрещён».

@@ -43,7 +43,7 @@ Never place cookies or private content credentials in a URL. Cookies support is 
 
 ## Railway deployment notes
 
-Build from the repository Dockerfile, expose the configured `PORT`, set one replica, and configure a public domain before starting the bot. The image installs FFmpeg, Deno, and the pinned yt-dlp version. Override the Docker build argument `YTDLP_VERSION` to select another release. `requirements.txt` lists the runtime extras and unpinned local development dependency; the Docker argument pins the production image. Current pin: `2026.10.26`.
+Build from the repository Dockerfile, expose the configured `PORT`, set one replica, and configure a public domain before starting the bot. The image installs FFmpeg, Deno `2.9.8`, and yt-dlp `2026.10.26`. `requirements.txt` and the Docker build argument `YTDLP_VERSION` are checked against the same version so a mismatch fails the image build. When upgrading yt-dlp, update the pin in both places; update `DENO_VERSION` independently when upgrading Deno.
 
 Webhook delivery may have a cold-start delay or a 502 on the first request; confirm actual retry and wake behavior in Railway logs and Metrics before relying on Serverless. This repository has not been deployed or observed on Railway as part of this work. Do not add external uptime pings. The bot checks webhook configuration on startup and has an in-memory queue, so pending jobs are lost if the process restarts.
 

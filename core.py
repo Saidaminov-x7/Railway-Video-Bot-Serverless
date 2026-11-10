@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import ipaddress
 import os
 import re
@@ -150,6 +152,10 @@ class Settings:
     max_queue: int
     timeout_sec: int
     upload_timeout_sec: int
+    max_items: int
+    rate_limit_per_min: int
+    cookies_b64: str | None
+    ytdlp_auto_update: bool
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
@@ -180,7 +186,17 @@ class Settings:
             # Reject public bot API here, which would silently break uploads >50 MB.
             if not parsed_api.hostname.endswith(".railway.internal") and parsed_api.hostname not in {"localhost", "127.0.0.1"}:
                 raise ValueError("TELEGRAM_API_BASE должен указывать на приватный сервис Railway")
-        default_mb = 45 if mode == "eco" else 1900
+        default_mb = 49 if mode == "eco" else 1950
+        cookies_b64 = values.get("COOKIES_B64", "").strip() or None
+        if cookies_b64:
+            try:
+                if len(cookies_b64) > 1_400_000 or not base64.b64decode(cookies_b64, validate=True):
+                    raise ValueError
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("COOKIES_B64: требуется base64 содержимого cookies.txt до 1 MB") from exc
+        auto_update = values.get("YTDLP_AUTO_UPDATE", "0").strip()
+        if auto_update not in {"0", "1"}:
+            raise ValueError("YTDLP_AUTO_UPDATE: допустимо 0 или 1")
         return cls(
             token=token,
             allowed_user_ids=allowed_ids,
@@ -191,8 +207,12 @@ class Settings:
             domains=site_allowlist(values),
             blocked_domains=_domain_list(values.get("BLOCKED_DOMAINS", ""), "BLOCKED_DOMAINS"),
             port=_positive_int(values, "PORT", 8080, 1, 65535),
-            max_file_mb=_positive_int(values, "MAX_FILE_MB", default_mb, 1, 45 if mode == "eco" else 1950),
+            max_file_mb=_positive_int(values, "MAX_FILE_MB", default_mb, 1, 49 if mode == "eco" else 1950),
             max_queue=_positive_int(values, "MAX_QUEUE", 20, 1, 200),
             timeout_sec=_positive_int(values, "DOWNLOAD_TIMEOUT", 3600, 60, 14400),
             upload_timeout_sec=_positive_int(values, "UPLOAD_TIMEOUT", 3600, 60, 14400),
+            max_items=_positive_int(values, "MAX_ITEMS", 10, 1, 10),
+            rate_limit_per_min=_positive_int(values, "RATE_LIMIT_PER_MIN", 10, 1, 60),
+            cookies_b64=cookies_b64,
+            ytdlp_auto_update=auto_update == "1",
         )

@@ -58,12 +58,12 @@ class CoreTests(unittest.TestCase):
         settings = Settings.from_env(env)
         self.assertEqual(settings.allowed_user_ids, frozenset({123456789}))
         self.assertEqual(settings.mode, "eco")
-        self.assertEqual(settings.max_file_mb, 45)
+        self.assertEqual(settings.max_file_mb, 49)
         self.assertEqual(settings.webhook_url, "https://example.up.railway.app/telegram-webhook")
         with self.assertRaises(ValueError):
-            Settings.from_env(env | {"MAX_FILE_MB": "1900"})
+            Settings.from_env(env | {"MAX_FILE_MB": "50"})
         large = Settings.from_env(env | {"BOT_MODE": "large", "TELEGRAM_API_BASE": "http://telegram-api.railway.internal:8081"})
-        self.assertEqual(large.max_file_mb, 1900)
+        self.assertEqual(large.max_file_mb, 1950)
         with self.assertRaises(ValueError):
             Settings.from_env(env | {"BOT_MODE": "large", "TELEGRAM_API_BASE": "https://api.telegram.org"})
 
@@ -73,6 +73,21 @@ class CoreTests(unittest.TestCase):
             Settings.from_env(env)
         with self.assertRaises(ValueError):
             Settings.from_env(env | {"TELEGRAM_ID_1": "123456789", "WEBHOOK_SECRET": "abc"})
+
+    def test_cookie_base64_and_resource_limits_are_validated(self):
+        env = {
+            "BOT_TOKEN": "123456789:" + "x" * 35,
+            "TELEGRAM_ID_1": "123456789",
+            "WEBHOOK_SECRET": "x" * 32,
+            "WEBHOOK_BASE_URL": "https://example.up.railway.app",
+        }
+        settings = Settings.from_env(env | {"COOKIES_B64": "bmV2ZXItdHJ1c3QtY29va2llcw==", "MAX_ITEMS": "5", "RATE_LIMIT_PER_MIN": "8"})
+        self.assertEqual(settings.max_items, 5)
+        self.assertEqual(settings.rate_limit_per_min, 8)
+        with self.assertRaisesRegex(ValueError, "COOKIES_B64"):
+            Settings.from_env(env | {"COOKIES_B64": "not base64"})
+        with self.assertRaisesRegex(ValueError, "MAX_ITEMS"):
+            Settings.from_env(env | {"MAX_ITEMS": "11"})
 
 
 if __name__ == "__main__":

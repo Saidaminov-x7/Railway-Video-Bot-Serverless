@@ -15,6 +15,7 @@ ENV YTDLP_AUTO_UPDATE=0
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && test "$(yt-dlp --version)" = "${YTDLP_VERSION}" \
+    && python -c "import gallery_dl" \
     && deno --version | head -n 1 | grep -F "${DENO_VERSION}"
 COPY app.py core.py jobs.py downloader.py ./
 USER botuser

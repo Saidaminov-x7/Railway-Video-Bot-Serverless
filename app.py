@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import shutil
 import tempfile
-from collections import OrderedDict
+import time
+from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -13,17 +15,32 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, Message
+from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo, Message
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
 from core import Settings, extract_links, public_url
-from downloader import DownloadProblem, fetch_video
+from downloader import DownloadProblem, DownloadedMedia, cleanup_ytdlp_runtime, fetch_video, update_ytdlp_runtime
 from jobs import GlobalFIFO, Job
 
 LOG = logging.getLogger("video-bot")
 QUEUE_TASK_KEY = web.AppKey("queue_task", asyncio.Task)
 SEEN_UPDATES = web.AppKey("seen_updates", OrderedDict)
+
+
+def cleanup_orphaned_tempdirs(root: Path | None = None) -> int:
+    """Remove only the bot's own temporary job directories before serving updates."""
+    temp_root = root or Path(tempfile.gettempdir())
+    removed = 0
+    for path in temp_root.glob("tg-video-*"):
+        if path.is_symlink() or not path.is_dir():
+            continue
+        try:
+            shutil.rmtree(path)
+            removed += 1
+        except OSError as exc:
+            LOG.warning("orphan temp cleanup failed: %s", type(exc).__name__)
+    return removed
 
 
 async def upload_video(bot: Bot, job: Job, settings: Settings) -> None:
@@ -40,18 +57,44 @@ async def upload_video(bot: Bot, job: Job, settings: Settings) -> None:
     task = asyncio.create_task(activity(), name="upload-keep-awake")
     try:
         with tempfile.TemporaryDirectory(prefix="tg-video-") as scratch:
-            file = await fetch_video(job.url, Path(scratch), settings)
+            downloaded: DownloadedMedia = await fetch_video(job.url, Path(scratch), settings)
             await progress.edit_text("Отправляю видео в Telegram…")
-            item = FSInputFile(file, filename="video" + file.suffix.lower())
-            if file.suffix.lower() == ".mp4":
-                await bot.send_video(
-                    chat_id=job.chat_id, video=item, supports_streaming=True,
-                    request_timeout=settings.upload_timeout_sec,
-                )
+            caption = f"{downloaded.title} · {downloaded.source}"[:1024]
+            items = downloaded.items[:settings.max_items]
+            reply = {"reply_to_message_id": job.message_id} if job.message_id is not None else {}
+            if len(items) == 1:
+                media = items[0]
+                common = {"chat_id": job.chat_id, "caption": caption, "request_timeout": settings.upload_timeout_sec, **reply}
+                if media.kind == "video":
+                    options = {
+                        **common, "video": FSInputFile(media.path, filename="video.mp4"),
+                        "supports_streaming": True, "width": media.width, "height": media.height, "duration": media.duration,
+                    }
+                    if media.thumbnail:
+                        options["thumbnail"] = FSInputFile(media.thumbnail)
+                    await bot.send_video(**options)
+                elif media.kind == "photo":
+                    await bot.send_photo(photo=FSInputFile(media.path), **common)
+                else:
+                    await bot.send_document(document=FSInputFile(media.path), **common)
             else:
-                await bot.send_document(
-                    chat_id=job.chat_id, document=item,
-                    request_timeout=settings.upload_timeout_sec,
+                telegram_media = []
+                for index, media in enumerate(items):
+                    item_caption = caption if index == 0 else None
+                    if media.kind == "video":
+                        telegram_media.append(InputMediaVideo(
+                            media=FSInputFile(media.path, filename=f"video-{index + 1}.mp4"),
+                            width=media.width or None, height=media.height or None,
+                            duration=media.duration or None, caption=item_caption,
+                            supports_streaming=True,
+                        ))
+                    else:
+                        telegram_media.append(InputMediaPhoto(
+                            media=FSInputFile(media.path), caption=item_caption,
+                        ))
+                await bot.send_media_group(
+                    chat_id=job.chat_id, media=telegram_media,
+                    request_timeout=settings.upload_timeout_sec, **reply,
                 )
         # TemporaryDirectory cleans up even after failure; no retained video.
         with contextlib.suppress(TelegramAPIError):
@@ -89,6 +132,7 @@ def make_app(settings: Settings) -> web.Application:
     )
     router = Router()
     dp = Dispatcher()
+    user_requests: dict[int, deque[float]] = defaultdict(deque)
 
     def allowed(message: Message) -> bool:
         return bool(message.from_user and message.from_user.id in settings.allowed_user_ids)
@@ -117,8 +161,9 @@ def make_app(settings: Settings) -> web.Application:
     @router.message(Command("cancel"), F.chat.type == "private")
     async def command_cancel(message: Message) -> None:
         if allowed(message):
-            removed = worker.remove_chat(message.chat.id)
-            await message.answer(f"Удалено из очереди: {removed}. Текущую загрузку отменить нельзя.")
+            removed, active = worker.cancel_chat(message.chat.id)
+            suffix = " Текущая задача отменена." if active else ""
+            await message.answer(f"Удалено ожидающих задач: {removed}.{suffix}")
 
     @router.message(F.chat.type == "private", F.text)
     async def message_text(message: Message) -> None:
@@ -132,15 +177,26 @@ def make_app(settings: Settings) -> web.Application:
             await message.answer("Пришли HTTPS-ссылку на видео с поддерживаемого сайта.")
             return
         positions = []
+        now = time.monotonic()
+        rate_limited = False
+        requests = user_requests[message.from_user.id]
+        while requests and requests[0] <= now - 60:
+            requests.popleft()
         for url in urls:
-            position = worker.add(Job(chat_id=message.chat.id, url=url))
+            if len(requests) >= settings.rate_limit_per_min:
+                rate_limited = True
+                break
+            position = worker.add(Job(chat_id=message.chat.id, url=url, message_id=message.message_id))
             if position is None:
                 break
             positions.append(position)
+            requests.append(now)
         info = f"Принято: {len(positions)}. Позиции в очереди: {', '.join(map(str, positions)) or 'нет'}."
         if invalid:
             info += f" Отклонено ссылок: {invalid}."
-        if len(positions) < len(urls):
+        if rate_limited:
+            info += f" Достигнут лимит: {settings.rate_limit_per_min} ссылок в минуту."
+        elif len(positions) < len(urls):
             info += " Очередь заполнена."
         # If sending acknowledgement fails, do not return 5xx to Telegram:
         # otherwise Telegram retries the same update and duplicates queued URLs.
@@ -158,6 +214,8 @@ def make_app(settings: Settings) -> web.Application:
 
     async def start(bot: Bot) -> None:
         # One in-memory worker for all users: no overlapping download or upload.
+        if settings.ytdlp_auto_update:
+            await update_ytdlp_runtime(settings)
         app[QUEUE_TASK_KEY] = asyncio.create_task(worker.run(), name="global-single-worker")
         # No drop_pending_updates: avoids discarding user messages during cold start.
         # max_connections=1 preserves order of delivery from Telegram as much as API allows.
@@ -172,6 +230,7 @@ def make_app(settings: Settings) -> web.Application:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        cleanup_ytdlp_runtime()
         # Do NOT delete webhook: it must remain registered while sleeping.
 
     dp.startup.register(start)
@@ -207,6 +266,7 @@ def make_app(settings: Settings) -> web.Application:
 
 def main() -> None:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    cleanup_orphaned_tempdirs()
     settings = Settings.from_env()
     web.run_app(make_app(settings), host="0.0.0.0", port=settings.port, access_log=None)
 

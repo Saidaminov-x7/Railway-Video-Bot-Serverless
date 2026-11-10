@@ -5,6 +5,39 @@ from jobs import GlobalFIFO, Job
 
 
 class QueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_active_chat_does_not_stop_global_worker(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        completed = []
+
+        async def processor(job):
+            if job.chat_id == 1:
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            completed.append(job.chat_id)
+
+        async def on_error(job):
+            return None
+
+        q = GlobalFIFO(limit=5, processor=processor, on_error=on_error)
+        worker = asyncio.create_task(q.run())
+        try:
+            q.add(Job(1, "first"))
+            q.add(Job(2, "second"))
+            await asyncio.wait_for(started.wait(), 1)
+            removed, active = q.cancel_chat(1)
+            self.assertEqual((removed, active), (0, True))
+            await asyncio.wait_for(cancelled.wait(), 1)
+            await asyncio.wait_for(q.queue.join(), 1)
+            self.assertEqual(completed, [2])
+        finally:
+            worker.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await worker
+
     async def test_two_jobs_really_sequential_across_users(self):
         started = asyncio.Event()
         release = asyncio.Event()

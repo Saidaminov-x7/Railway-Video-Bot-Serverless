@@ -13,6 +13,7 @@ LOG = logging.getLogger("video-bot.queue")
 class Job:
     chat_id: int
     url: str
+    message_id: int | None = None
 
 
 class GlobalFIFO:
@@ -21,6 +22,8 @@ class GlobalFIFO:
         self.processor = processor
         self.on_error = on_error
         self.active = False
+        self.current_job: Job | None = None
+        self.processing_task: asyncio.Task[None] | None = None
 
     def add(self, job: Job) -> int | None:
         position = self.queue.qsize() + int(self.active) + 1
@@ -48,12 +51,24 @@ class GlobalFIFO:
             self.queue.put_nowait(job)
         return removed
 
+    def cancel_chat(self, chat_id: int) -> tuple[int, bool]:
+        removed = self.remove_chat(chat_id)
+        active = bool(self.current_job and self.current_job.chat_id == chat_id and self.processing_task)
+        if active and self.processing_task:
+            self.processing_task.cancel()
+        return removed, active
+
     async def run(self) -> None:
         while True:
             job = await self.queue.get()
             self.active = True
+            self.current_job = job
+            self.processing_task = asyncio.create_task(self.processor(job))
             try:
-                await self.processor(job)
+                await self.processing_task
+            except asyncio.CancelledError:
+                if asyncio.current_task() and asyncio.current_task().cancelling():
+                    raise
             except Exception as exc:
                 # Never print user URL, Telegram credentials, raw extractor errors.
                 LOG.warning("job failed: %s", type(exc).__name__)
@@ -62,5 +77,7 @@ class GlobalFIFO:
                 except Exception as notify_error:
                     LOG.warning("job error notification failed: %s", type(notify_error).__name__)
             finally:
+                self.processing_task = None
+                self.current_job = None
                 self.active = False
                 self.queue.task_done()

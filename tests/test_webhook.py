@@ -40,6 +40,21 @@ def update(user_id, text, seq=1):
     }
 
 
+def callback_update(user_id, data, seq=1):
+    return {
+        "update_id": seq,
+        "callback_query": {
+            "id": f"callback-{seq}", "from": {"id": user_id, "is_bot": False, "first_name": "Tester"},
+            "chat_instance": "chat-instance",
+            "message": {
+                "message_id": seq, "date": int(time.time()),
+                "chat": {"id": user_id, "type": "private"}, "text": "Menu",
+            },
+            "data": data,
+        },
+    }
+
+
 class WebhookTests(unittest.IsolatedAsyncioTestCase):
     async def test_startup_cleanup_removes_only_bot_temp_directories(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -93,6 +108,17 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
         return response
 
+    async def post_callback(self, uid, data, seq=1):
+        response = await self.client.post(
+            "/telegram-webhook", json=callback_update(uid, data, seq=seq),
+            headers={"X-Telegram-Bot-Api-Secret-Token": SECRET},
+        )
+        if response.status == 200:
+            async with asyncio.timeout(2):
+                while self.bot_call.await_count < 2:
+                    await asyncio.sleep(0.01)
+        return response
+
     async def test_secret_header_and_health(self):
         health = await self.client.get("/health")
         self.assertEqual(health.status, 200)
@@ -105,13 +131,33 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
     async def test_authorized_id_has_access_without_password(self):
         response = await self.post(OWNER_ID, "/start")
         self.assertEqual(response.status, 200)
-        self.assertIn("Доступ открыт", self.bot_call.await_args.args[0].text)
+        start_message = self.bot_call.await_args.args[0]
+        self.assertIn("Привет! Я помогу скачать видео", start_message.text)
+        self.assertIn("сам подберу качество и формат", start_message.text)
+        self.assertEqual(len(start_message.reply_markup.inline_keyboard), 2)
+        self.assertNotIn("340p", start_message.text)
+        self.assertNotIn("MP3", start_message.text)
+
+    async def test_link_acknowledgement_is_friendly_and_hides_queue_positions(self):
+        with patch("app.public_url", new=AsyncMock(return_value=False)):
+            response = await self.post(OWNER_ID, "https://example.org/video", seq=20)
+        self.assertEqual(response.status, 200)
+        text = self.bot_call.await_args.args[0].text
+        self.assertIn("Ссылка принята.", text)
+        self.assertIn("пришлю видео в этот чат", text)
+        self.assertNotIn("Позиции", text)
+
+    async def test_menu_help_button_edits_menu_message(self):
+        response = await self.post_callback(OWNER_ID, "menu:help", seq=21)
+        self.assertEqual(response.status, 200)
+        edited = [call.args[0] for call in self.bot_call.await_args_list if hasattr(call.args[0], "text")]
+        self.assertTrue(any("Как скачать видео" in method.text for method in edited))
 
     async def test_unauthorized_link_does_not_enqueue(self):
         response = await self.post(GUEST_ID, "https://youtu.be/example")
         self.assertEqual(response.status, 200)
         text = self.bot_call.await_args.args[0].text
-        self.assertIn("Доступ запрещён", text)
+        self.assertIn("Доступ к боту ограничен", text)
         self.video.assert_not_awaited()
 
     async def test_any_user_can_read_own_id_but_not_download(self):
@@ -159,4 +205,4 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.public_url", new=AsyncMock(return_value=False)):
             response = await self.post(OWNER_ID, "https://example.org/a https://example.org/b", seq=3)
         self.assertEqual(response.status, 200)
-        self.assertIn("1 ссылок в минуту", self.bot_call.await_args.args[0].text)
+        self.assertIn("не более 1 ссылку", self.bot_call.await_args.args[0].text)

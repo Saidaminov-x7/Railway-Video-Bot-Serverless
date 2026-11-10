@@ -8,6 +8,10 @@ The bot uses one bounded global FIFO worker, private-chat access by Telegram ID,
 
 Cookies are optional and intended only for the owner's lawful access. They are written with mode 0600 under the job's temporary directory and removed with it. The application removes its own orphaned `tg-video-*` directories at startup. `YTDLP_AUTO_UPDATE=1` opts into a startup update and can increase cold-start time; leave it disabled for normal Serverless use. Extractor failures can trigger one per-job yt-dlp update attempt.
 
+## Using the bot
+
+`/start` opens a short welcome screen with buttons for help, queue status, and cancelling your own tasks. To download a video, send its link in the private chat. The bot chooses a Telegram-compatible format automatically; there are no resolution or MP3 choices. It confirms that the link was accepted, shows concise progress, then replaces the progress text with a completion or recovery message. The video is sent as a reply to the original link. `/help`, `/status`, `/cancel`, and `/id` are also available.
+
 No site download or Telegram delivery is marked successful unless it has actually been run. The table below is updated from real opt-in tests; current local test results and untested platforms are reported at the end of a development run, not inferred from yt-dlp's extractor list.
 
 | Site | Real download result in this environment |

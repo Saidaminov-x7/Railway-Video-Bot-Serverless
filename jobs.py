@@ -14,6 +14,7 @@ class Job:
     chat_id: int
     url: str
     message_id: int | None = None
+    format_choice: str = "best"
 
 
 class GlobalFIFO:

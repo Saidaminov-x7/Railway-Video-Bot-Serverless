@@ -10,7 +10,7 @@ Cookies are optional and intended only for the owner's lawful access. They are w
 
 ## Using the bot
 
-`/start` opens a short welcome screen with buttons for help, queue status, and cancelling your own tasks. To download a video, send its link in the private chat. The bot chooses a Telegram-compatible format automatically; there are no resolution or MP3 choices. It confirms that the link was accepted, shows concise progress, then replaces the progress text with a completion or recovery message. The video is sent as a reply to the original link. `/help`, `/status`, `/cancel`, and `/id` are also available.
+`/start` explains the flow without clutter buttons. Send a video link in the private chat; the bot replies with format buttons for 360p, 720p, 1080p, or MP3. It downloads only after you choose. The requested video resolution is a maximum: if the source has less detail, the delivered file keeps the source quality and the caption shows the actual resolution. Audio is delivered as an MP3 file. Each selected link joins the single global FIFO queue, and the result is sent as a reply to the original link. `/help`, `/status`, `/cancel`, and `/id` remain available as commands.
 
 No site download or Telegram delivery is marked successful unless it has actually been run. The table below is updated from real opt-in tests; current local test results and untested platforms are reported at the end of a development run, not inferred from yt-dlp's extractor list.
 

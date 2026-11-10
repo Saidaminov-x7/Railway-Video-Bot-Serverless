@@ -98,10 +98,10 @@ def _format_score(video: dict[str, Any], audio: dict[str, Any] | None = None) ->
     return compatible, int(video.get("height") or 0), int(video.get("fps") or 0), int(video.get("tbr") or 0)
 
 
-def select_format(formats: list[dict[str, Any]], max_bytes: int) -> FormatSelection:
+def select_format(formats: list[dict[str, Any]], max_bytes: int, max_height: int | None = None) -> FormatSelection:
     """Choose the highest-quality known-size single or split format under the cap."""
     valid_id = re.compile(r"^[A-Za-z0-9_.-]+$")
-    videos = [f for f in formats if f.get("vcodec") not in (None, "none") and valid_id.fullmatch(str(f.get("format_id", "")))]
+    videos = [f for f in formats if f.get("vcodec") not in (None, "none") and valid_id.fullmatch(str(f.get("format_id", ""))) and (max_height is None or (f.get("height") and int(f["height"]) <= max_height))]
     audios = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none") and valid_id.fullmatch(str(f.get("format_id", "")))]
     candidates: list[tuple[tuple[int, int, int, int], int | None, str]] = []
     for video in videos:
@@ -120,6 +120,18 @@ def select_format(formats: list[dict[str, Any]], max_bytes: int) -> FormatSelect
     score, size, selector = max(pool, key=lambda candidate: (candidate[0], candidate[1] or 0))
     del score
     return FormatSelection(selector, size, bool(fitting))
+
+
+def select_audio_format(formats: list[dict[str, Any]], max_bytes: int) -> FormatSelection:
+    valid_id = re.compile(r"^[A-Za-z0-9_.-]+$")
+    audios = [item for item in formats if item.get("vcodec") == "none" and item.get("acodec") not in (None, "none") and valid_id.fullmatch(str(item.get("format_id", "")))]
+    if not audios:
+        return FormatSelection("bestaudio", None, False)
+    fitting = [item for item in audios if _format_size(item) is not None and _format_size(item) <= max_bytes]
+    candidates = fitting or audios
+    selected = max(candidates, key=lambda item: (int(item.get("abr") or 0), int(item.get("tbr") or 0), _format_size(item) or 0))
+    size = _format_size(selected)
+    return FormatSelection(str(selected["format_id"]), size, bool(fitting))
 
 
 def disk_used(directory: Path) -> int:
@@ -183,7 +195,7 @@ async def _run_process(
 
 def _yt_dlp_args(
     url: str, *, selector: str | None = None, metadata: bool = False, generic: bool = False,
-    cookies: Path | None = None, package_root: Path | None = None,
+    cookies: Path | None = None, package_root: Path | None = None, audio: bool = False,
 ) -> list[str]:
     executable = [sys.executable, "-m", "yt_dlp"]
     args = [
@@ -198,6 +210,8 @@ def _yt_dlp_args(
         args.extend(["--cookies", str(cookies)])
     if metadata:
         args.extend(["-J", "--skip-download"])
+    elif audio:
+        args.extend(["-f", selector or "bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", "0", "-o", str(Path("audio.%(ext)s"))])
     else:
         args.extend(["-f", selector or "best", "--merge-output-format", "mp4", "-o", str(Path("video.%(ext)s"))])
     args.extend(["--", url])
@@ -245,10 +259,10 @@ async def _update_ytdlp(folder: Path, timeout_sec: int, disk_limit: int) -> Path
 
 async def _run_ytdlp(
     url: str, folder: Path, settings: Settings, state: UpdateState, *,
-    selector: str | None = None, metadata: bool = False, generic: bool = False, cookies: Path | None = None,
+    selector: str | None = None, metadata: bool = False, generic: bool = False, cookies: Path | None = None, audio: bool = False,
 ) -> tuple[int, str, str]:
     return await _run_process(
-        _yt_dlp_args(url, selector=selector, metadata=metadata, generic=generic, cookies=cookies, package_root=state.package_root),
+        _yt_dlp_args(url, selector=selector, metadata=metadata, generic=generic, cookies=cookies, package_root=state.package_root, audio=audio),
         folder, settings.timeout_sec, capture_stdout=metadata, disk_limit=settings.max_file_mb * 1_000_000 * 3,
         env=_package_env(state.package_root),
     )
@@ -414,20 +428,24 @@ async def _download_gallery(url: str, folder: Path, settings: Settings, cookies:
     return DownloadedMedia(tuple(items), "Медиа с сайта", source)
 
 
-async def _fetch_video(url: str, folder: Path, settings: Settings) -> DownloadedMedia:
+async def _fetch_video(url: str, folder: Path, settings: Settings, format_choice: str = "best") -> DownloadedMedia:
     folder.mkdir(parents=True, exist_ok=True)
     cookie_file = _write_cookie_file(folder, getattr(settings, "cookies_b64", None))
     max_bytes = settings.max_file_mb * 1_000_000
     update_state = UpdateState(attempted=_STARTUP_PACKAGE_ROOT is not None, package_root=_STARTUP_PACKAGE_ROOT)
     try:
         metadata = await _metadata(url, folder, settings, cookie_file, update_state)
-        selection = select_format(metadata.get("formats", []), max_bytes)
+        if format_choice == "mp3":
+            selection = select_audio_format(metadata.get("formats", []), max_bytes)
+        else:
+            max_height = {"v360": 360, "v720": 720, "v1080": 1080}.get(format_choice)
+            selection = select_format(metadata.get("formats", []), max_bytes, max_height=max_height)
     except DownloadProblem as exc:
-        if exc.category in {"unsupported", "extractor", "unknown"}:
+        if format_choice != "mp3" and exc.category in {"unsupported", "extractor", "unknown"}:
             return await _download_gallery(url, folder, settings, cookie_file)
         raise
     for attempt in range(3):
-        code, _output, stderr = await _run_ytdlp(url, folder, settings, update_state, selector=selection.format_selector)
+        code, _output, stderr = await _run_ytdlp(url, folder, settings, update_state, selector=selection.format_selector, audio=format_choice == "mp3", cookies=cookie_file)
         if code == 0:
             break
         error = classify_ytdlp_error(stderr)
@@ -436,7 +454,7 @@ async def _fetch_video(url: str, folder: Path, settings: Settings) -> Downloaded
             update_state.attempted = True
             update_state.package_root = await _update_ytdlp(folder, settings.timeout_sec, max_bytes * 3)
             if update_state.package_root:
-                code, _output, stderr = await _run_ytdlp(url, folder, settings, update_state, selector=selection.format_selector)
+                code, _output, stderr = await _run_ytdlp(url, folder, settings, update_state, selector=selection.format_selector, audio=format_choice == "mp3", cookies=cookie_file)
                 if code == 0:
                     break
                 error = classify_ytdlp_error(stderr)
@@ -445,6 +463,11 @@ async def _fetch_video(url: str, folder: Path, settings: Settings) -> Downloaded
             raise DownloadProblem(error.user_message)
         await asyncio.sleep(2**attempt)
     output = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}]
+    if format_choice == "mp3":
+        audio_files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".mp3"]
+        if len(audio_files) != 1 or audio_files[0].stat().st_size > max_bytes:
+            raise DownloadProblem("Аудиофайл слишком большой для выбранного режима. Попробуйте сократить длительность.", "size")
+        return DownloadedMedia((DownloadedItem("audio", audio_files[0]),), str(metadata.get("title") or "Аудио")[:300], urlsplit(url).hostname or "")
     if len(output) != 1:
         raise DownloadProblem("Не удалось определить готовое видео.")
     title = str(metadata.get("title") or "Видео")[:300]
@@ -458,10 +481,10 @@ async def _fetch_video(url: str, folder: Path, settings: Settings) -> Downloaded
     )
 
 
-async def fetch_video(url: str, folder: Path, settings: Settings) -> DownloadedMedia:
+async def fetch_video(url: str, folder: Path, settings: Settings, format_choice: str = "best") -> DownloadedMedia:
     try:
         async with asyncio.timeout(settings.timeout_sec):
-            return await _fetch_video(url, folder, settings)
+            return await _fetch_video(url, folder, settings, format_choice)
     except TimeoutError as exc:
         raise DownloadProblem("Истекло общее время обработки ссылки.") from exc
 

@@ -74,6 +74,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         progress.edit_text = AsyncMock()
         self.send.return_value = progress
         self.video = AsyncMock()
+        self.audio = AsyncMock()
         self.photo = AsyncMock()
         self.media_group = AsyncMock()
         self.webhook = AsyncMock()
@@ -81,10 +82,11 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         self.patchers = [
             patch.object(Bot, "send_message", new=self.send),
             patch.object(Bot, "send_video", new=self.video),
+            patch.object(Bot, "send_audio", new=self.audio),
             patch.object(Bot, "send_photo", new=self.photo),
             patch.object(Bot, "send_media_group", new=self.media_group),
             patch.object(Bot, "set_webhook", new=self.webhook),
-            patch.object(Bot, "get_webhook_info", new=AsyncMock(return_value=MagicMock(url="https://test.up.railway.app/telegram-webhook", max_connections=1))),
+            patch.object(Bot, "get_webhook_info", new=AsyncMock(return_value=MagicMock(url="https://test.up.railway.app/telegram-webhook", max_connections=1, allowed_updates=["message", "callback_query"]))),
             patch.object(Bot, "__call__", new=self.bot_call),
         ]
         for p in self.patchers:
@@ -133,25 +135,42 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         start_message = self.bot_call.await_args.args[0]
         self.assertIn("Привет! Я помогу скачать видео", start_message.text)
-        self.assertIn("сам подберу качество и формат", start_message.text)
-        self.assertEqual(len(start_message.reply_markup.inline_keyboard), 2)
-        self.assertNotIn("340p", start_message.text)
-        self.assertNotIn("MP3", start_message.text)
+        self.assertIn("выберите качество видео или аудио MP3", start_message.text)
+        self.assertIsNone(start_message.reply_markup)
 
-    async def test_link_acknowledgement_is_friendly_and_hides_queue_positions(self):
+    async def test_link_prompts_for_quality_or_audio_without_global_menu(self):
         with patch("app.public_url", new=AsyncMock(return_value=False)):
             response = await self.post(OWNER_ID, "https://example.org/video", seq=20)
         self.assertEqual(response.status, 200)
-        text = self.bot_call.await_args.args[0].text
-        self.assertIn("Ссылка принята.", text)
-        self.assertIn("пришлю видео в этот чат", text)
-        self.assertNotIn("Позиции", text)
+        prompt = self.bot_call.await_args.args[0]
+        self.assertIn("Выберите формат", prompt.text)
+        buttons = [button.callback_data for row in prompt.reply_markup.inline_keyboard for button in row]
+        self.assertEqual(buttons, ["pick:1:v360", "pick:1:v720", "pick:1:v1080", "pick:1:mp3"])
 
-    async def test_menu_help_button_edits_menu_message(self):
-        response = await self.post_callback(OWNER_ID, "menu:help", seq=21)
+    async def test_format_button_queues_selected_choice(self):
+        with patch("app.public_url", new=AsyncMock(return_value=False)):
+            await self.post(OWNER_ID, "https://example.org/video", seq=20)
+        response = await self.post_callback(OWNER_ID, "pick:1:v720", seq=21)
         self.assertEqual(response.status, 200)
-        edited = [call.args[0] for call in self.bot_call.await_args_list if hasattr(call.args[0], "text")]
-        self.assertTrue(any("Как скачать видео" in method.text for method in edited))
+        self.assertTrue(any("Видео 720p" in str(call.args[0]) for call in self.bot_call.await_args_list))
+
+    async def test_mp3_choice_sends_audio_instead_of_video(self):
+        async def fake_fetch(url: str, folder: Path, cfg: Settings, choice: str) -> DownloadedMedia:
+            self.assertEqual(choice, "mp3")
+            audio_path = folder / "audio.mp3"
+            audio_path.write_bytes(b"audio")
+            return DownloadedMedia((DownloadedItem("audio", audio_path),), "Test audio", "example.org")
+
+        with patch("app.public_url", new=AsyncMock(return_value=True)), patch("app.fetch_video", new=fake_fetch):
+            await self.post(OWNER_ID, "https://example.org/audio", seq=30)
+            prompt = self.bot_call.await_args.args[0]
+            await self.post_callback(OWNER_ID, prompt.reply_markup.inline_keyboard[2][0].callback_data, seq=31)
+            async with asyncio.timeout(2):
+                while self.audio.await_count < 1:
+                    await asyncio.sleep(0.025)
+        self.audio.assert_awaited_once()
+        self.video.assert_not_awaited()
+        self.assertEqual(self.audio.await_args.kwargs["title"], "Test audio")
 
     async def test_unauthorized_link_does_not_enqueue(self):
         response = await self.post(GUEST_ID, "https://youtu.be/example")
@@ -166,7 +185,8 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(str(GUEST_ID), self.bot_call.await_args.args[0].text)
 
     async def test_authorized_downloads_reach_upload(self):
-        async def fake_fetch(url: str, folder: Path, cfg: Settings) -> Path:
+        async def fake_fetch(url: str, folder: Path, cfg: Settings, choice: str) -> Path:
+            self.assertEqual(choice, "v720")
             file = folder / "video.mp4"
             file.write_bytes(b"test-content")
             return DownloadedMedia((DownloadedItem("video", file, 1920, 1080, 7),), "Test video", "youtube.com")
@@ -174,6 +194,9 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.public_url", new=AsyncMock(return_value=True)), patch("app.fetch_video", new=fake_fetch):
             response = await self.post(OWNER_ID, "https://youtu.be/abc")
             self.assertEqual(response.status, 200)
+            prompt = self.bot_call.await_args.args[0]
+            callback_data = prompt.reply_markup.inline_keyboard[0][1].callback_data
+            await self.post_callback(OWNER_ID, callback_data, seq=100)
             async with asyncio.timeout(2):
                 while self.video.await_count < 1:
                     await asyncio.sleep(0.025)
@@ -183,7 +206,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(args["reply_to_message_id"], 1)
 
     async def test_photo_gallery_is_sent_as_ordered_media_group(self):
-        async def fake_fetch(url: str, folder: Path, cfg: Settings) -> DownloadedMedia:
+        async def fake_fetch(url: str, folder: Path, cfg: Settings, choice: str) -> DownloadedMedia:
             files = []
             for index in range(2):
                 path = folder / f"photo-{index}.jpg"
@@ -194,6 +217,8 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.public_url", new=AsyncMock(return_value=True)), patch("app.fetch_video", new=fake_fetch):
             response = await self.post(OWNER_ID, "https://example.org/a https://example.org/b", seq=2)
             self.assertEqual(response.status, 200)
+            prompt = self.bot_call.await_args_list[0].args[0]
+            await self.post_callback(OWNER_ID, prompt.reply_markup.inline_keyboard[0][0].callback_data, seq=22)
             async with asyncio.timeout(2):
                 while self.media_group.await_count < 1:
                     await asyncio.sleep(0.025)

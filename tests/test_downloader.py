@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import downloader
 
-from downloader import DownloadProblem, UpdateState, _download_gallery, _make_thumbnail, _metadata, _normalize_video, _run_process, _write_cookie_file, classify_ytdlp_error, cleanup_ytdlp_runtime, disk_used, fetch_video, select_format, update_ytdlp_runtime
+from downloader import DownloadProblem, UpdateState, _download_gallery, _make_thumbnail, _metadata, _normalize_video, _run_process, _write_cookie_file, _yt_dlp_args, classify_ytdlp_error, cleanup_ytdlp_runtime, disk_used, fetch_video, select_audio_format, select_format, update_ytdlp_runtime
 
 
 class DownloadTests(unittest.IsolatedAsyncioTestCase):
@@ -64,6 +64,19 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         choice = select_format(formats, 35_000_000)
         self.assertEqual(choice.format_selector, "v720+a1")
         self.assertEqual(choice.estimated_size, 33_000_000)
+
+    async def test_format_choices_cap_video_height_and_select_audio(self):
+        formats = [
+            {"format_id": "v360", "vcodec": "avc1", "acodec": "none", "height": 360, "filesize": 3_000_000},
+            {"format_id": "v720", "vcodec": "avc1", "acodec": "none", "height": 720, "filesize": 8_000_000},
+            {"format_id": "v1080", "vcodec": "avc1", "acodec": "none", "height": 1080, "filesize": 15_000_000},
+            {"format_id": "a1", "vcodec": "none", "acodec": "mp4a", "abr": 128, "filesize": 2_000_000},
+        ]
+        self.assertEqual(select_format(formats, 49_000_000, 360).format_selector, "v360+a1")
+        self.assertEqual(select_audio_format(formats, 49_000_000).format_selector, "a1")
+        args = _yt_dlp_args("https://example.org/video", selector="a1", audio=True)
+        self.assertIn("--audio-format", args)
+        self.assertIn("mp3", args)
 
     async def test_metadata_retries_network_errors_with_exponential_backoff(self):
         config = SimpleNamespace(timeout_sec=60, max_file_mb=49)

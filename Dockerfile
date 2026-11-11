@@ -17,6 +17,6 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && test "$(yt-dlp --version)" = "${YTDLP_VERSION}" \
     && python -c "import gallery_dl" \
     && deno --version | head -n 1 | grep -F "${DENO_VERSION}"
-COPY app.py core.py jobs.py downloader.py ./
+COPY app.py core.py jobs.py downloader.py messages.py ./
 USER botuser
 CMD ["python", "app.py"]

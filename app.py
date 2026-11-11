@@ -9,20 +9,34 @@ import tempfile
 import time
 from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramEntityTooLarge
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Message,
+)
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
 from core import Settings, extract_links, public_url
-from downloader import DownloadProblem, DownloadedMedia, cleanup_ytdlp_runtime, fetch_video, update_ytdlp_runtime
+from downloader import (
+    DownloadedMedia,
+    DownloadProblem,
+    cleanup_ytdlp_runtime,
+    fetch_video,
+    update_ytdlp_runtime,
+)
 from jobs import GlobalFIFO, Job
+from messages import VideoFormat, get_format_buttons, get_message, get_plural_word
 
 LOG = logging.getLogger("video-bot")
 QUEUE_TASK_KEY = web.AppKey("queue_task", asyncio.Task)
@@ -30,29 +44,15 @@ SEEN_UPDATES = web.AppKey("seen_updates", OrderedDict)
 
 
 def format_menu(token: int) -> InlineKeyboardMarkup:
+    labels = get_format_buttons()
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎬 Видео 360p", callback_data=f"pick:{token}:v360"), InlineKeyboardButton(text="🎬 Видео 720p", callback_data=f"pick:{token}:v720")],
-        [InlineKeyboardButton(text="✨ Видео 1080p", callback_data=f"pick:{token}:v1080")],
-        [InlineKeyboardButton(text="🎵 Аудио MP3", callback_data=f"pick:{token}:mp3")],
+        [InlineKeyboardButton(text=labels["v360"], callback_data=f"pick:{token}:v360"), InlineKeyboardButton(text=labels["v720"], callback_data=f"pick:{token}:v720")],
+        [InlineKeyboardButton(text=labels["v1080"], callback_data=f"pick:{token}:v1080"), InlineKeyboardButton(text=labels["mp3"], callback_data=f"pick:{token}:mp3")],
     ])
 
 
-def _link_word(count: int) -> str:
-    remainder_10, remainder_100 = count % 10, count % 100
-    if remainder_10 == 1 and remainder_100 != 11:
-        return "ссылка"
-    if remainder_10 in (2, 3, 4) and remainder_100 not in (12, 13, 14):
-        return "ссылки"
-    return "ссылок"
-
-
-def _task_word(count: int) -> str:
-    remainder_10, remainder_100 = count % 10, count % 100
-    if remainder_10 == 1 and remainder_100 != 11:
-        return "задача"
-    if remainder_10 in (2, 3, 4) and remainder_100 not in (12, 13, 14):
-        return "задачи"
-    return "задач"
+async def send_start_message(message: Message) -> None:
+    await message.answer(get_message("START_MESSAGE"))
 
 
 def cleanup_orphaned_tempdirs(root: Path | None = None) -> int:
@@ -72,7 +72,7 @@ def cleanup_orphaned_tempdirs(root: Path | None = None) -> int:
 
 async def upload_video(bot: Bot, job: Job, settings: Settings) -> None:
     progress = await bot.send_message(
-        job.chat_id, "⏳ Начинаю подготовку файла…",
+        job.chat_id, get_message("PROCESSING_MESSAGE"),
         reply_to_message_id=job.message_id,
     )
 
@@ -88,13 +88,18 @@ async def upload_video(bot: Bot, job: Job, settings: Settings) -> None:
     try:
         with tempfile.TemporaryDirectory(prefix="tg-video-") as scratch:
             downloaded: DownloadedMedia = await fetch_video(job.url, Path(scratch), settings, job.format_choice)
-            await progress.edit_text("📤 Почти готово — отправляю файл…")
+            await progress.edit_text(get_message("PROCESSING_MESSAGE"))
             items = downloaded.items[:settings.max_items]
-            quality = {"v360": " · 360p", "v720": " · 720p", "v1080": " · 1080p", "mp3": " · MP3"}.get(job.format_choice, "")
+            quality = {
+                "v360": get_message("QUALITY_360P"),
+                "v720": get_message("QUALITY_720P"),
+                "v1080": get_message("QUALITY_1080P"),
+                "mp3": get_message("QUALITY_MP3"),
+            }.get(job.format_choice, "")
             if job.format_choice != "mp3" and items:
                 actual_height = max((item.height for item in items), default=0)
                 quality = f" · {actual_height}p" if actual_height else ""
-            caption = f"{downloaded.title}{quality}\n🌐 {downloaded.source}"[:1024]
+            caption = get_message("MEDIA_CAPTION_MESSAGE", title=downloaded.title, quality=quality, source=downloaded.source)[:1024]
             reply = {"reply_to_message_id": job.message_id} if job.message_id is not None else {}
             if len(items) == 1:
                 media = items[0]
@@ -134,16 +139,23 @@ async def upload_video(bot: Bot, job: Job, settings: Settings) -> None:
                 )
         # TemporaryDirectory cleans up even after failure; no retained video.
         with contextlib.suppress(TelegramAPIError):
-            await progress.edit_text("✅ Готово! Файл отправлен выше.")
+            await progress.edit_text(get_message("SUCCESS_MESSAGE"))
     except DownloadProblem as exc:
+        if exc.category == "login":
+            error_message = get_message("ERROR_LOGIN_REQUIRED_MESSAGE")
+        else:
+            error_message = get_message("ERROR_GENERIC_MESSAGE")
         with contextlib.suppress(TelegramAPIError):
-            await progress.edit_text(f"⚠️ {exc}")
+            await progress.edit_text(error_message)
+    except TelegramEntityTooLarge:
+        with contextlib.suppress(TelegramAPIError):
+            await progress.edit_text(get_message("ERROR_FILE_TOO_LARGE_MESSAGE", limit_mb=settings.max_file_mb))
     except TelegramAPIError:
         with contextlib.suppress(TelegramAPIError):
-            await progress.edit_text("Не получилось отправить файл. Попробуйте прислать ссылку ещё раз.")
+            await progress.edit_text(get_message("ERROR_GENERIC_MESSAGE"))
     except asyncio.CancelledError:
         with contextlib.suppress(TelegramAPIError):
-            await progress.edit_text("⏹ Задача отменена.")
+            await progress.edit_text(get_message("CANCELLED_MESSAGE"))
         raise
     finally:
         task.cancel()
@@ -162,7 +174,7 @@ def make_app(settings: Settings) -> web.Application:
     async def process(job: Job) -> None:
         if not await public_url(job.url, settings.domains, settings.blocked_domains):
             await bot.send_message(
-                job.chat_id, "⚠️ Эту ссылку нельзя безопасно открыть. Проверьте её и попробуйте другую.",
+                job.chat_id, get_message("JOB_UNSAFE_URL_MESSAGE"),
                 reply_to_message_id=job.message_id,
             )
             return
@@ -170,7 +182,7 @@ def make_app(settings: Settings) -> web.Application:
 
     async def notify_job_error(job: Job) -> None:
         await bot.send_message(
-            job.chat_id, "Не удалось обработать ссылку. Попробуйте ещё раз чуть позже.",
+            job.chat_id, get_message("ERROR_GENERIC_MESSAGE"),
             reply_to_message_id=job.message_id,
         )
 
@@ -197,43 +209,29 @@ def make_app(settings: Settings) -> web.Application:
     @router.message(Command("id"), F.chat.type == "private")
     async def command_id(message: Message) -> None:
         if message.from_user:
-            await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
+            await message.answer(get_message("ID_MESSAGE", user_id=message.from_user.id))
 
     @router.message(Command("start"), F.chat.type == "private")
     async def command_start(message: Message) -> None:
         if allowed(message):
-            await message.answer(
-                "👋 Привет! Я помогу скачать видео.\n\n"
-                "Отправьте ссылку, затем выберите качество видео или аудио MP3.\n\n"
-                "📌 Отправляйте только контент, который вы вправе скачивать.",
-            )
+            await send_start_message(message)
         else:
-            user_id = message.from_user.id if message.from_user else "неизвестен"
-            await message.answer(
-                f"🔒 Доступ к боту ограничен.\nВаш Telegram ID: {user_id}\n"
-                "Попросите владельца бота добавить ваш ID."
-            )
+            user_id = message.from_user.id if message.from_user else get_message("UNKNOWN_USER")
+            await message.answer(get_message("ACCESS_START_MESSAGE", user_id=user_id))
 
     @router.message(Command("help"), F.chat.type == "private")
     async def command_help(message: Message) -> None:
-        await message.answer(
-            "📥 Как скачать видео\n"
-            "1. Скопируйте ссылку на видео или публикацию.\n"
-            "2. Отправьте её мне в личный чат.\n"
-            "3. Выберите разрешение видео или MP3.\n"
-            "4. Дождитесь готового файла.\n\n"
-            "Можно отправить несколько ссылок одним сообщением. Задачи обрабатываются по очереди.",
-        )
+        await message.answer(get_message("HELP_MESSAGE"))
 
     @router.message(Command("status"), F.chat.type == "private")
     async def command_status(message: Message) -> None:
         if allowed(message):
-            state = "⏳ Сейчас обрабатываю видео." if worker.active else "💤 Сейчас ничего не скачиваю."
+            state = get_message("STATUS_ACTIVE_MESSAGE") if worker.active else get_message("STATUS_IDLE_MESSAGE")
             await message.answer(
-                f"📊 В очереди: {worker.queue.qsize()} {_task_word(worker.queue.qsize())}.\n{state}",
+                get_message("STATUS_QUEUE_MESSAGE", count=worker.queue.qsize(), task_word=get_plural_word("task", worker.queue.qsize()), state=state),
             )
         else:
-            await message.answer("🔒 Эта команда доступна только пользователям бота.")
+            await message.answer(get_message("ACCESS_COMMAND_MESSAGE"))
 
     @router.message(Command("cancel"), F.chat.type == "private")
     async def command_cancel(message: Message) -> None:
@@ -244,15 +242,15 @@ def make_app(settings: Settings) -> web.Application:
                 pending_choices.pop(token, None)
             messages = []
             if removed:
-                messages.append(f"Убрал из очереди: {removed} {_link_word(removed)}")
+                messages.append(get_message("CANCEL_QUEUE_MESSAGE", count=removed, link_word=get_plural_word("link", removed)))
             if active:
-                messages.append("Текущую загрузку остановил")
+                messages.append(get_message("CANCEL_ACTIVE_MESSAGE"))
             if pending:
-                messages.append(f"Отменил выбор формата: {len(pending)} {_link_word(len(pending))}")
-            result = "\n".join(messages) if messages else "У вас нет активных или ожидающих задач."
-            await message.answer(f"🗑 {result}.")
+                messages.append(get_message("CANCEL_PENDING_MESSAGE", count=len(pending), link_word=get_plural_word("link", len(pending))))
+            result = "\n".join(messages) if messages else get_message("CANCEL_EMPTY_MESSAGE")
+            await message.answer(get_message("CANCEL_RESULT_MESSAGE", result=result))
         else:
-            await message.answer("🔒 Эта команда доступна только пользователям бота.")
+            await message.answer(get_message("ACCESS_COMMAND_MESSAGE"))
 
     @router.callback_query(F.data.startswith("pick:"))
     async def choose_format(callback: CallbackQuery) -> None:
@@ -261,30 +259,42 @@ def make_app(settings: Settings) -> web.Application:
             await callback.answer()
             return
         if callback.from_user.id not in settings.allowed_user_ids:
-            await callback.answer("Доступ к боту ограничен.", show_alert=True)
+            await callback.answer(get_message("ACCESS_ALERT_MESSAGE"), show_alert=True)
             return
         try:
             _, raw_token, choice = callback.data.split(":", 2)
             token = int(raw_token)
         except (AttributeError, ValueError):
-            await callback.answer("Эта кнопка устарела. Пришлите ссылку ещё раз.", show_alert=True)
+            await callback.answer(get_message("STALE_BUTTON_MESSAGE"), show_alert=True)
             return
         if choice not in {"v360", "v720", "v1080", "mp3"}:
-            await callback.answer("Неизвестный формат.", show_alert=True)
+            await callback.answer(get_message("UNKNOWN_FORMAT_MESSAGE"), show_alert=True)
             return
         pending = pending_choices.pop(token, None)
         job = pending[0] if pending else None
         if not job or job.chat_id != callback.message.chat.id:
-            await callback.answer("Эта ссылка уже обработана или устарела.", show_alert=True)
+            await callback.answer(get_message("STALE_LINK_MESSAGE"), show_alert=True)
             return
         position = worker.add(Job(job.chat_id, job.url, job.message_id, choice))
         if position is None:
-            await callback.message.edit_text("⌛ Очередь заполнена. Отправьте ссылку ещё раз чуть позже.")
+            await callback.bot.send_message(
+                job.chat_id, get_message("QUEUE_FULL_MESSAGE"), reply_to_message_id=job.message_id,
+            )
             await callback.answer()
             return
-        label = {"v360": "видео 360p", "v720": "видео 720p", "v1080": "видео 1080p", "mp3": "аудио MP3"}[choice]
+        label = {
+            "v360": VideoFormat.VIDEO_360P,
+            "v720": VideoFormat.VIDEO_720P,
+            "v1080": VideoFormat.VIDEO_1080P,
+            "mp3": VideoFormat.AUDIO_MP3,
+        }[choice]
+        selected_message = (
+            get_message("FORMAT_SELECTED_MESSAGE", format_label=label.value)
+            if position == 1 else
+            get_message("FORMAT_SELECTED_QUEUED_MESSAGE", format_label=label.value, queue_position=position)
+        )
         with contextlib.suppress(TelegramAPIError):
-            await callback.message.edit_text(f"✅ Выбрано: {label}. Ссылка добавлена в очередь.")
+            await callback.bot.send_message(job.chat_id, selected_message, reply_to_message_id=job.message_id)
         await callback.answer()
 
     @router.message(F.chat.type == "private", F.text)
@@ -293,13 +303,11 @@ def make_app(settings: Settings) -> web.Application:
         if not message.from_user or not message.text:
             return
         if not allowed(message):
-            await message.answer("🔒 Доступ к боту ограничен. Узнать свой ID можно командой /id.")
+            await message.answer(get_message("ACCESS_MESSAGE"), reply_to_message_id=message.message_id)
             return
         urls, invalid = extract_links(message.text, settings.domains, blocked=settings.blocked_domains)
         if not urls:
-            await message.answer(
-                "🔗 Не нашёл ссылку в сообщении. Отправьте публичную ссылку на видео или публикацию.",
-            )
+            await message.answer(get_message("INVALID_LINK_MESSAGE"), reply_to_message_id=message.message_id)
             return
         now = time.monotonic()
         rate_limited = False
@@ -317,37 +325,36 @@ def make_app(settings: Settings) -> web.Application:
             token = next_choice_token
             next_choice_token += 1
             pending_choices[token] = (Job(chat_id=message.chat.id, url=url, message_id=message.message_id), now)
-            host = urlsplit(url).hostname or "сайт"
             with contextlib.suppress(TelegramAPIError):
+                await message.answer(get_message("LINK_RECEIVED_MESSAGE"), reply_to_message_id=message.message_id)
                 await message.answer(
-                    f"🎬 Выберите формат\n🌐 {host}\n\nКакой файл подготовить?",
+                    get_message("FORMAT_PROMPT_MESSAGE"),
                     reply_markup=format_menu(token),
+                    reply_to_message_id=message.message_id,
                 )
         accepted = sum(1 for job, _ in pending_choices.values() if job.message_id == message.message_id and job.chat_id == message.chat.id)
         info_lines = []
         if invalid:
-            info_lines.append(f"⚠️ Не удалось распознать ссылок: {invalid}.")
+            info_lines.append(get_message("INVALID_LINK_MESSAGE"))
         if rate_limited:
             limit = settings.rate_limit_per_min
-            limit_word = "ссылку" if limit == 1 else _link_word(limit)
-            info_lines.append(f"⏱ Лимит — не более {limit} {limit_word} в минуту.")
+            limit_word = get_message("RATE_LIMIT_ONE_LINK") if limit == 1 else get_plural_word("link", limit)
+            info_lines.append(get_message("RATE_LIMIT_MESSAGE", limit=limit, link_word=limit_word))
         elif accepted < len(urls):
-            info_lines.append("⌛ Очередь сейчас заполнена. Попробуйте отправить оставшиеся ссылки позже.")
+            info_lines.append(get_message("QUEUE_FULL_LINKS_MESSAGE"))
         info = "\n".join(info_lines)
         # If sending acknowledgement fails, do not return 5xx to Telegram:
         # otherwise Telegram retries the same update and duplicates queued URLs.
         if info:
             with contextlib.suppress(TelegramAPIError):
-                await message.answer(info)
+                await message.answer(info, reply_to_message_id=message.message_id)
 
     @router.message(F.chat.type == "private")
     async def unknown_message(message: Message) -> None:
         if allowed(message):
-            await message.answer(
-                "💡 Отправьте ссылку на видео, и я подготовлю его для просмотра в Telegram.",
-            )
+            await message.answer(get_message("UNKNOWN_MESSAGE"))
         else:
-            await message.answer("🔒 Доступ к боту ограничен. Узнать свой ID можно командой /id.")
+            await message.answer(get_message("ACCESS_MESSAGE"))
 
     dp.include_router(router)
 

@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from core import Settings
+from messages import get_message
 
 LOG = logging.getLogger("video-bot.downloader")
 _STARTUP_PACKAGE_ROOT: Path | None = None
@@ -67,24 +68,25 @@ class UpdateState:
 
 
 _ERRORS = (
-    ("drm", re.compile(r"\bdrm\b|digital rights management|protected by drm", re.I), "Это видео защищено DRM и не может быть обработано."),
-    ("private", re.compile(r"private video|video is private|private content", re.I), "Видео закрыто или доступно только его владельцу."),
-    ("login", re.compile(r"sign in|log ?in|authentication required|confirm your age|cookies are required", re.I), "Для этого видео требуется вход в аккаунт."),
-    ("geo", re.compile(r"not available in your country|geo.?restricted|country.{0,20}blocked|geographic restriction", re.I), "Видео недоступно в вашем регионе."),
-    ("deleted", re.compile(r"has been removed|video unavailable.{0,30}deleted|this video does not exist|page not found", re.I), "Видео удалено или ссылка больше не действует."),
-    ("size", re.compile(r"max.?filesize|file is larger|file size.{0,20}(?:exceed|limit)|too large", re.I), "Видео превышает лимит размера отправки."),
-    ("rate_limit", re.compile(r"http error 429|too many requests|rate.?limit", re.I), "Сайт временно ограничил запросы. Попробуйте позже.", True),
-    ("network", re.compile(r"timed? ?out|connection reset|temporary failure|name resolution|network is unreachable|http error 5\d\d", re.I), "Не удалось связаться с сайтом. Повторяю попытку.", True),
-    ("unsupported", re.compile(r"no video formats found|unsupported url|no suitable extractor|unsupported site", re.I), "Этот формат или сайт пока не поддерживается."),
+    ("drm", re.compile(r"\bdrm\b|digital rights management|protected by drm", re.IGNORECASE)),
+    ("private", re.compile(r"private video|video is private|private content", re.IGNORECASE)),
+    ("login", re.compile(r"sign in|log ?in|authentication required|confirm your age|cookies are required", re.IGNORECASE)),
+    ("geo", re.compile(r"not available in your country|geo.?restricted|country.{0,20}blocked|geographic restriction", re.IGNORECASE)),
+    ("deleted", re.compile(r"has been removed|video unavailable.{0,30}deleted|this video does not exist|page not found", re.IGNORECASE)),
+    ("size", re.compile(r"max.?filesize|file is larger|file size.{0,20}(?:exceed|limit)|too large", re.IGNORECASE)),
+    ("rate_limit", re.compile(r"http error 429|too many requests|rate.?limit", re.IGNORECASE), True),
+    ("network", re.compile(r"timed? ?out|connection reset|temporary failure|name resolution|network is unreachable|http error 5\d\d", re.IGNORECASE), True),
+    ("unsupported", re.compile(r"no video formats found|unsupported url|no suitable extractor|unsupported site", re.IGNORECASE)),
 )
 
 
 def classify_ytdlp_error(stderr: str) -> ClassifiedError:
     """Map extractor diagnostics to a safe stable category and Russian user message."""
-    for category, pattern, message, *flags in _ERRORS:
+    for category, pattern, *flags in _ERRORS:
         if pattern.search(stderr):
-            return ClassifiedError(category, message, bool(flags and flags[0]), category == "unsupported")
-    return ClassifiedError("extractor", "Не удалось обработать эту ссылку.", extractor_failure=True)
+            message_key = "ERROR_LOGIN_REQUIRED_MESSAGE" if category == "login" else "ERROR_GENERIC_MESSAGE"
+            return ClassifiedError(category, get_message(message_key), bool(flags and flags[0]), category == "unsupported")
+    return ClassifiedError("extractor", get_message("ERROR_GENERIC_MESSAGE"), extractor_failure=True)
 
 
 def _format_size(item: dict[str, Any]) -> int | None:
@@ -425,7 +427,7 @@ async def _download_gallery(url: str, folder: Path, settings: Settings, cookies:
         if error.category != "extractor":
             raise DownloadProblem(error.user_message, error.category)
         raise DownloadProblem("На странице не найдено доступных фото или видео.", "unsupported")
-    return DownloadedMedia(tuple(items), "Медиа с сайта", source)
+    return DownloadedMedia(tuple(items), get_message("MEDIA_TITLE_GALLERY"), source)
 
 
 async def _fetch_video(url: str, folder: Path, settings: Settings, format_choice: str = "best") -> DownloadedMedia:
@@ -467,10 +469,10 @@ async def _fetch_video(url: str, folder: Path, settings: Settings, format_choice
         audio_files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".mp3"]
         if len(audio_files) != 1 or audio_files[0].stat().st_size > max_bytes:
             raise DownloadProblem("Аудиофайл слишком большой для выбранного режима. Попробуйте сократить длительность.", "size")
-        return DownloadedMedia((DownloadedItem("audio", audio_files[0]),), str(metadata.get("title") or "Аудио")[:300], urlsplit(url).hostname or "")
+        return DownloadedMedia((DownloadedItem("audio", audio_files[0]),), str(metadata.get("title") or get_message("MEDIA_TITLE_AUDIO"))[:300], urlsplit(url).hostname or "")
     if len(output) != 1:
         raise DownloadProblem("Не удалось определить готовое видео.")
-    title = str(metadata.get("title") or "Видео")[:300]
+    title = str(metadata.get("title") or get_message("MEDIA_TITLE_VIDEO"))[:300]
     normalized, probe = await _normalize_video(output[0], folder, settings, metadata.get("duration"))
     video = _video_stream(probe)
     duration = round(float(probe.get("format", {}).get("duration") or metadata.get("duration") or 0))

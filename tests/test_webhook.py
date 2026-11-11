@@ -1,7 +1,7 @@
 """Local HTTP integration tests using real aiohttp/aiogram routing and mocked Telegram API."""
 import asyncio
-import time
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,6 +12,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from app import cleanup_orphaned_tempdirs, make_app
 from core import Settings
 from downloader import DownloadedItem, DownloadedMedia
+from messages import VideoFormat, get_message
 
 OWNER_ID = 123456789
 GUEST_ID = 112233445
@@ -111,13 +112,14 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         return response
 
     async def post_callback(self, uid, data, seq=1):
+        previous_calls = self.bot_call.await_count
         response = await self.client.post(
             "/telegram-webhook", json=callback_update(uid, data, seq=seq),
             headers={"X-Telegram-Bot-Api-Secret-Token": SECRET},
         )
         if response.status == 200:
             async with asyncio.timeout(2):
-                while self.bot_call.await_count < 2:
+                while self.bot_call.await_count <= previous_calls:
                     await asyncio.sleep(0.01)
         return response
 
@@ -134,25 +136,67 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         response = await self.post(OWNER_ID, "/start")
         self.assertEqual(response.status, 200)
         start_message = self.bot_call.await_args.args[0]
-        self.assertIn("Привет! Я помогу скачать видео", start_message.text)
-        self.assertIn("выберите качество видео или аудио MP3", start_message.text)
+        self.assertEqual(start_message.text, get_message("START_MESSAGE"))
+        self.assertIn("(видео 360p / 720p / 1080p) или аудио MP3", start_message.text)
         self.assertIsNone(start_message.reply_markup)
 
     async def test_link_prompts_for_quality_or_audio_without_global_menu(self):
         with patch("app.public_url", new=AsyncMock(return_value=False)):
             response = await self.post(OWNER_ID, "https://example.org/video", seq=20)
         self.assertEqual(response.status, 200)
-        prompt = self.bot_call.await_args.args[0]
-        self.assertIn("Выберите формат", prompt.text)
-        buttons = [button.callback_data for row in prompt.reply_markup.inline_keyboard for button in row]
+        link_received = self.bot_call.await_args_list[0].args[0]
+        self.assertEqual(link_received.text, get_message("LINK_RECEIVED_MESSAGE"))
+        self.assertEqual(link_received.reply_to_message_id, 20)
+        format_prompt = self.bot_call.await_args_list[1].args[0]
+        self.assertEqual(format_prompt.text, get_message("FORMAT_PROMPT_MESSAGE"))
+        self.assertEqual(format_prompt.reply_to_message_id, 20)
+        buttons = [button.callback_data for row in format_prompt.reply_markup.inline_keyboard for button in row]
         self.assertEqual(buttons, ["pick:1:v360", "pick:1:v720", "pick:1:v1080", "pick:1:mp3"])
+        self.assertEqual([len(row) for row in format_prompt.reply_markup.inline_keyboard], [2, 2])
 
     async def test_format_button_queues_selected_choice(self):
         with patch("app.public_url", new=AsyncMock(return_value=False)):
             await self.post(OWNER_ID, "https://example.org/video", seq=20)
         response = await self.post_callback(OWNER_ID, "pick:1:v720", seq=21)
         self.assertEqual(response.status, 200)
-        self.assertTrue(any("Видео 720p" in str(call.args[0]) for call in self.bot_call.await_args_list))
+        expected = get_message("FORMAT_SELECTED_MESSAGE", format_label=VideoFormat.VIDEO_720P.value)
+        calls = [*self.bot_call.await_args_list, *self.send.await_args_list]
+        self.assertTrue(any(expected in repr(call) for call in calls), repr(calls))
+        self.assertTrue(any("reply_to_message_id=20" in repr(call) for call in calls))
+
+    async def test_platforms_use_identical_link_selection_and_success_text(self):
+        await self.client.close()
+        platforms = (
+            "https://youtu.be/example",
+            "https://www.tiktok.com/@creator/video/12345",
+            "https://www.instagram.com/reel/example/",
+        )
+        for index, url in enumerate(platforms, start=1):
+            self.client = TestClient(TestServer(make_app(settings())))
+            await self.client.start_server()
+            self.bot_call.reset_mock()
+            self.video.reset_mock()
+            self.send.reset_mock()
+            self.send.return_value.edit_text.reset_mock()
+
+            async def fake_fetch(video_url: str, folder: Path, cfg: Settings, choice: str) -> DownloadedMedia:
+                path = folder / "video.mp4"
+                path.write_bytes(b"video")
+                return DownloadedMedia((DownloadedItem("video", path),), "Test video", video_url.split("/")[2])
+
+            with patch("app.public_url", new=AsyncMock(return_value=True)), patch("app.fetch_video", new=fake_fetch):
+                await self.post(OWNER_ID, url, seq=100 + index)
+                prompt = next(call.args[0] for call in self.bot_call.await_args_list if call.args[0].reply_markup)
+                await self.post_callback(OWNER_ID, prompt.reply_markup.inline_keyboard[0][0].callback_data, seq=200 + index)
+                async with asyncio.timeout(2):
+                    while self.video.await_count < 1:
+                        await asyncio.sleep(0.01)
+
+            selected = get_message("FORMAT_SELECTED_MESSAGE", format_label=VideoFormat.VIDEO_360P.value)
+            self.assertTrue(any(selected in repr(call) for call in self.send.await_args_list))
+            self.assertTrue(any("reply_to_message_id" in repr(call) and str(100 + index) in repr(call) for call in self.send.await_args_list), repr(self.send.await_args_list))
+            self.assertTrue(any(call.args and call.args[0] == get_message("SUCCESS_MESSAGE") for call in self.send.return_value.edit_text.await_args_list))
+            await self.client.close()
 
     async def test_mp3_choice_sends_audio_instead_of_video(self):
         async def fake_fetch(url: str, folder: Path, cfg: Settings, choice: str) -> DownloadedMedia:
@@ -164,7 +208,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.public_url", new=AsyncMock(return_value=True)), patch("app.fetch_video", new=fake_fetch):
             await self.post(OWNER_ID, "https://example.org/audio", seq=30)
             prompt = self.bot_call.await_args.args[0]
-            await self.post_callback(OWNER_ID, prompt.reply_markup.inline_keyboard[2][0].callback_data, seq=31)
+            await self.post_callback(OWNER_ID, prompt.reply_markup.inline_keyboard[1][1].callback_data, seq=31)
             async with asyncio.timeout(2):
                 while self.audio.await_count < 1:
                     await asyncio.sleep(0.025)
@@ -217,7 +261,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.public_url", new=AsyncMock(return_value=True)), patch("app.fetch_video", new=fake_fetch):
             response = await self.post(OWNER_ID, "https://example.org/a https://example.org/b", seq=2)
             self.assertEqual(response.status, 200)
-            prompt = self.bot_call.await_args_list[0].args[0]
+            prompt = next(call.args[0] for call in self.bot_call.await_args_list if call.args[0].reply_markup)
             await self.post_callback(OWNER_ID, prompt.reply_markup.inline_keyboard[0][0].callback_data, seq=22)
             async with asyncio.timeout(2):
                 while self.media_group.await_count < 1:
